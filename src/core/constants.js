@@ -1,0 +1,23 @@
+const C = Object.freeze({
+    PLUGIN_ID: 'ace.ai.neosantara',
+    VERSION: '0.8.16',
+    STORAGE_KEY: 'ace-ai.settings.v8_8',
+    PRESETS_KEY: 'ace-ai.presets.v8_8',
+    CHAT_KEY: 'ace-ai.chat.v8_8',
+    RUNTIME_KEY: 'ace-ai.runtime.v8_8',
+    RESPONSE_KEY: 'ace-ai.responses.v8_8',
+    DEFAULT_BASE_URL: 'https://api.neosantara.xyz/v1',
+    DEFAULT_MODEL: 'grok-4.1-fast-non-reasoning',
+    MAX_SELECTION: 18000,
+    MAX_FULL_FILE: 42000,
+    MAX_CHAT_MESSAGES: 50,
+    REQUEST_TIMEOUT_MS: 60000,
+    REQUEST_RETRY_COUNT: 2,
+    REQUEST_RETRY_BASE_MS: 750,
+    MAX_CONTEXT_WINDOW: 18000,
+    MAX_TOOL_READ_CHARS: 30000,
+    MAX_TOOL_SEARCH_FILES: 40,
+    MAX_TOOL_SEARCH_RESULTS: 80,
+    PANEL_ACTION_ID: 'ace-ai.close-panel',
+    SIDEBAR_ID: 'ace-ai-sidebar'
+  });

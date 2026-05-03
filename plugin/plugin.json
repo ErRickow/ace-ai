@@ -1,0 +1,35 @@
+{
+  "id": "ace.ai.neosantara",
+  "name": "Ace AI",
+  "main": "main.js",
+  "version": "0.8.16",
+  "readme": "readme.md",
+  "changelogs": "changelogs.md",
+  "icon": "icon.png",
+  "files": [
+    "main.js",
+    "plugin.json",
+    "readme.md",
+    "changelogs.md",
+    "icon.png"
+  ],
+  "minVersionCode": 316,
+  "price": 0,
+  "author": {
+    "name": "Neosantara",
+    "email": "support@neosantara.xyz",
+    "url": "https://neosantara.xyz"
+  },
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "neosantara",
+    "cursor",
+    "assistant",
+    "coding",
+    "agent",
+    "tools",
+    "edit"
+  ],
+  "description": "Agent-first AI coding assistant for Acode with cursor-aware context, codebase read tools, and permission-aware reviewable edits."
+}

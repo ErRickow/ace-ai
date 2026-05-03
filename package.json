@@ -1,0 +1,10 @@
+{
+  "name": "ace-ai-acode-plugin",
+  "version": "0.8.16",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "check": "npm run build && node -c plugin/main.js"
+  }
+}
