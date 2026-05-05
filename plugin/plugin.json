@@ -2,7 +2,7 @@
   "id": "ace.ai.neosantara",
   "name": "Ace AI",
   "main": "main.js",
-  "version": "0.8.43",
+  "version": "0.8.44",
   "readme": "readme.md",
   "changelogs": "changelogs.md",
   "icon": "icon.png",

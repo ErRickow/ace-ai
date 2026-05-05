@@ -1,3 +1,8 @@
+## 0.8.44
+
+- Switched project and plugin licensing metadata to Apache-2.0.
+- Added repository `LICENSE` file with Apache License 2.0 terms.
+
 ## 0.8.43
 
 - Fixed unsafe new-file persistence behavior when Project Root is unavailable.
