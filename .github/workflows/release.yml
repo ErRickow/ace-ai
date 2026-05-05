@@ -1,0 +1,66 @@
+name: Build release ZIP
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Acode plugin ZIP
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate source
+        run: npm run check
+
+      - name: Read plugin version
+        id: version
+        run: |
+          VERSION="$(node -p "require('./plugin/plugin.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "zip_name=ace-ai-acode-plugin-$VERSION.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Package installable plugin
+        run: |
+          mkdir -p dist
+          cd plugin
+          zip -r "../dist/${{ steps.version.outputs.zip_name }}" \
+            main.js \
+            plugin.json \
+            readme.md \
+            changelogs.md \
+            icon.png
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ace-ai-acode-plugin-${{ steps.version.outputs.version }}
+          path: dist/${{ steps.version.outputs.zip_name }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/${{ steps.version.outputs.zip_name }}" \
+            --title "Ace AI ${{ steps.version.outputs.version }}" \
+            --notes-file plugin/changelogs.md
