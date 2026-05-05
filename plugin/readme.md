@@ -2,7 +2,7 @@
 
 Author: Er Rickow
 
-License: MIT
+License: Apache-2.0
 
 Ace AI is an Acode-native AI coding assistant powered by the Neosantara Responses API. It supports normal chat, code explanations, codebase inspection, and review-first file edits from inside Acode.
 

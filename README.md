@@ -2,7 +2,7 @@
 
 Author: Er Rickow
 
-License: MIT
+License: Apache-2.0
 
 Ace AI is an Acode-native AI coding assistant for the Neosantara Responses API. This repository contains the modular source used to build the installable Acode plugin bundle in `plugin/main.js`.
 

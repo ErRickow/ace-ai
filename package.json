@@ -16,7 +16,7 @@
     "prettier": "^3.8.3"
   },
   "author": "Er Rickow",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "keywords": [
     "acode",
     "acode-plugin",
