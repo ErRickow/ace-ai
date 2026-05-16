@@ -110,7 +110,7 @@ const ProjectHistory = {
       // Also remove the entry from the _index array
       const indexKey = this.PREFIX + "_index";
       const index = Store.getJson(indexKey, []);
-      const filtered = index.filter((item) => item.key !== key);
+      const filtered = (Array.isArray(index) ? index : []).filter((item) => item && item.key !== key);
       Store.setJson(indexKey, filtered);
     }
   },
