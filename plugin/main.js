@@ -6937,6 +6937,16 @@
     _maxOutputChars: 8000,
     _captureEnabled: true,
 
+    _pushHistory(cmd, output, exitCode, time) {
+      State.terminalHistory.unshift({
+        command: cmd,
+        output: (output || "").slice(0, 500),
+        exitCode: exitCode,
+        time: time,
+      });
+      State.terminalHistory = State.terminalHistory.slice(0, 10);
+    },
+
     lastCapture() {
       return {
         command: this._lastCommand,
@@ -6996,13 +7006,7 @@
               this._lastOutput = this._lastOutput.slice(0, this._maxOutputChars);
               this._truncated = true;
             }
-            State.terminalHistory.unshift({
-              command: cmd,
-              output: this._lastOutput.slice(0, 500),
-              exitCode: this._lastExitCode,
-              time: this._lastTime,
-            });
-            State.terminalHistory = State.terminalHistory.slice(0, 10);
+            this._pushHistory(cmd, this._lastOutput, this._lastExitCode, this._lastTime);
             return this.lastCapture();
           }
         }
@@ -7019,13 +7023,7 @@
         this._lastExitCode = 1;
       }
 
-      State.terminalHistory.unshift({
-        command: cmd,
-        output: this._lastOutput.slice(0, 500),
-        exitCode: this._lastExitCode,
-        time: this._lastTime,
-      });
-      State.terminalHistory = State.terminalHistory.slice(0, 10);
+      this._pushHistory(cmd, this._lastOutput, this._lastExitCode, this._lastTime);
 
       return this.lastCapture();
     },
