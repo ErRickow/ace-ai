@@ -561,20 +561,21 @@ const Editor = {
   },
   offChange(fn) {
     const m = this.manager();
-    if (!m || typeof m.off !== "function") return;
-    [
-      "switch-file",
-      "file-loaded",
-      "save-file",
-      "file-content-changed",
-      "rename-file",
-      "change",
-      "changeSelection",
-    ].forEach((event) => {
-      try {
-        m.off(event, fn);
-      } catch (_) {}
-    });
+    if (m && typeof m.off === "function") {
+      [
+        "switch-file",
+        "file-loaded",
+        "save-file",
+        "file-content-changed",
+        "rename-file",
+        "change",
+        "changeSelection",
+      ].forEach((event) => {
+        try {
+          m.off(event, fn);
+        } catch (_) {}
+      });
+    }
     State.editorListeners = State.editorListeners.filter(([, f]) => f !== fn);
   },
   removeListeners() {
