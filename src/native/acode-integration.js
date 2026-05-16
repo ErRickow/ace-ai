@@ -310,23 +310,39 @@ const Native = {
     this.ensureSelectionMenuCompactCss();
     if (State.selectionMenuObserver) return;
     const run = () => this.sanitizeSelectionMenuDom();
+    // Throttle: run at most once per 150ms to avoid excessive DOM queries
+    // on every mutation in the document body.
+    let pending = false;
+    let lastRun = 0;
+    const THROTTLE_MS = 150;
+    const throttledRun = () => {
+      if (pending) return;
+      const elapsed = Date.now() - lastRun;
+      if (elapsed >= THROTTLE_MS) {
+        lastRun = Date.now();
+        run();
+      } else {
+        pending = true;
+        setTimeout(() => {
+          pending = false;
+          lastRun = Date.now();
+          run();
+        }, THROTTLE_MS - elapsed);
+      }
+    };
     try {
-      const observer = new window.MutationObserver(() => {
-        try {
-          requestAnimationFrame(run);
-        } catch (_) {
-          setTimeout(run, 0);
-        }
-      });
+      const observer = new window.MutationObserver(throttledRun);
       observer.observe(document.body, { childList: true, subtree: true });
       State.selectionMenuObserver = observer;
     } catch (_) {}
     try {
-      document.addEventListener("selectionchange", run, { passive: true });
-      State.selectionMenuSanitizer = run;
+      document.addEventListener("selectionchange", throttledRun, {
+        passive: true,
+      });
+      State.selectionMenuSanitizer = throttledRun;
     } catch (_) {}
     run();
-    [20, 120, 350, 800, 1500].forEach((delay) => {
+    [120, 800, 1500].forEach((delay) => {
       try {
         setTimeout(run, delay);
       } catch (_) {}

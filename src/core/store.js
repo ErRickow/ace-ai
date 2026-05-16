@@ -9,15 +9,38 @@ const Store = {
   getJson(key, fallback) {
     try {
       const raw = localStorage.getItem(key);
-      return raw !== null ? JSON.parse(raw) : fallback;
-    } catch (_) {
+      if (raw === null) return fallback;
+      const parsed = JSON.parse(raw);
+      // Basic validation: parsed value must be a non-null object or array
+      // for structured keys. Primitive values (string, number, boolean) are
+      // also valid for simple settings.
+      if (parsed === null || parsed === undefined) return fallback;
+      return parsed;
+    } catch (error) {
+      // JSON is corrupted or unreadable — remove the bad entry to prevent
+      // repeated parse failures, then return the safe fallback.
+      try {
+        localStorage.removeItem(key);
+      } catch (_) {}
+      console.warn(
+        "Ace AI: removed corrupted localStorage key:",
+        key,
+        error.message || error,
+      );
       return fallback;
     }
   },
   setJson(key, value) {
     try {
       localStorage.setItem(key, JSON.stringify(value));
-    } catch (_) {}
+    } catch (error) {
+      // localStorage may be full (quota exceeded). Warn but do not crash.
+      console.warn(
+        "Ace AI: localStorage write failed for key:",
+        key,
+        error.message || error,
+      );
+    }
   },
   settings() {
     return Object.assign({}, Defaults, this.getJson(C.STORAGE_KEY, {}));

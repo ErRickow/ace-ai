@@ -507,7 +507,7 @@ const Client = {
   ) {
     let result = null;
     let options = initialOptions || {};
-    const maxRounds = 5;
+    const maxRounds = C.MAX_READ_TOOL_ROUNDS;
     const collectedReadResults = [];
     const deferredWriteCalls = [];
     for (let round = 0; round < maxRounds; round++) {
