@@ -30,6 +30,7 @@
     MAX_TOOL_SEARCH_FILES: 80,
     MAX_TOOL_SEARCH_RESULTS: 120,
     MAX_TOOL_SEARCH_CONTEXT_LINES: 2,
+    MAX_READ_TOOL_ROUNDS: 5,
     PANEL_ACTION_ID: "ace-ai.close-panel",
     SIDEBAR_ID: "ace-ai-sidebar",
   });
@@ -573,7 +574,15 @@
         return `<span class="ace-ai-hl-property">${escaped}</span>`;
       return escaped;
     },
+    // Simple memoization cache for markdown rendering to avoid re-parsing
+    // identical text on every render cycle. Stores last N results.
+    _mdCache: new Map(),
+    _mdCacheMax: 24,
     markdown(text) {
+      const inputKey = String(text || "");
+      if (!inputKey.trim()) return "";
+      const cached = this._mdCache.get(inputKey);
+      if (cached !== undefined) return cached;
       const source = this.prepareMarkdownText(this.normalizeModelText(text));
       const blocks = [];
       let last = 0;
@@ -713,7 +722,14 @@
         last = fence.lastIndex;
       }
       if (last < source.length) blocks.push(renderText(source.slice(last)));
-      return blocks.join("") || "";
+      const result = blocks.join("") || "";
+      // Evict oldest entries when cache is full
+      if (this._mdCache.size >= this._mdCacheMax) {
+        const firstKey = this._mdCache.keys().next().value;
+        this._mdCache.delete(firstKey);
+      }
+      this._mdCache.set(inputKey, result);
+      return result;
     },
     baseUrl(value) {
       return String(value || C.DEFAULT_BASE_URL)
@@ -1169,15 +1185,38 @@
     getJson(key, fallback) {
       try {
         const raw = localStorage.getItem(key);
-        return raw !== null ? JSON.parse(raw) : fallback;
-      } catch (_) {
+        if (raw === null) return fallback;
+        const parsed = JSON.parse(raw);
+        // Basic validation: parsed value must be a non-null object or array
+        // for structured keys. Primitive values (string, number, boolean) are
+        // also valid for simple settings.
+        if (parsed === null || parsed === undefined) return fallback;
+        return parsed;
+      } catch (error) {
+        // JSON is corrupted or unreadable — remove the bad entry to prevent
+        // repeated parse failures, then return the safe fallback.
+        try {
+          localStorage.removeItem(key);
+        } catch (_) {}
+        console.warn(
+          "Ace AI: removed corrupted localStorage key:",
+          key,
+          error.message || error,
+        );
         return fallback;
       }
     },
     setJson(key, value) {
       try {
         localStorage.setItem(key, JSON.stringify(value));
-      } catch (_) {}
+      } catch (error) {
+        // localStorage may be full (quota exceeded). Warn but do not crash.
+        console.warn(
+          "Ace AI: localStorage write failed for key:",
+          key,
+          error.message || error,
+        );
+      }
     },
     settings() {
       return Object.assign({}, Defaults, this.getJson(C.STORAGE_KEY, {}));
@@ -1241,6 +1280,8 @@
         clean.push(next);
       });
       this.setJson(C.CHAT_KEY, clean.slice(-C.MAX_CHAT_MESSAGES));
+      // Also persist to project-specific history
+      try { ProjectHistory.saveCurrentChat(); } catch (_) {}
     },
     responseState() {
       return this.getJson(C.RESPONSE_KEY, {
@@ -2031,6 +2072,24 @@
         } catch (_) {}
       });
     },
+    offChange(fn) {
+      const m = this.manager();
+      if (!m || typeof m.off !== "function") return;
+      [
+        "switch-file",
+        "file-loaded",
+        "save-file",
+        "file-content-changed",
+        "rename-file",
+        "change",
+        "changeSelection",
+      ].forEach((event) => {
+        try {
+          m.off(event, fn);
+        } catch (_) {}
+      });
+      State.editorListeners = State.editorListeners.filter(([, f]) => f !== fn);
+    },
     removeListeners() {
       const m = this.manager();
       if (!m || typeof m.off !== "function") return;
@@ -2553,6 +2612,10 @@
       if (mentions.length) {
         user +=
           "The user referenced files with @file syntax. Use read_file for those paths before making assumptions if the contents are not already in context.\n\n";
+      }
+      if (TerminalCapture.lastCapture().output) {
+        const termCtx = TerminalCapture.contextForAgent();
+        if (termCtx) user += termCtx + "\n\n";
       }
       if (attachments.length) {
         user += "Pinned context snapshots from the user:\n";
@@ -3163,7 +3226,7 @@
     ) {
       let result = null;
       let options = initialOptions || {};
-      const maxRounds = 5;
+      const maxRounds = C.MAX_READ_TOOL_ROUNDS;
       const collectedReadResults = [];
       const deferredWriteCalls = [];
       for (let round = 0; round < maxRounds; round++) {
@@ -6630,6 +6693,1153 @@
     },
   };
 
+  // ---- features/ghost-complete.js ----
+  /**
+   * Feature 1: Inline Ghost Text Autocomplete
+   *
+   * Creates a CodeMirror 6 extension that shows greyed-out AI suggestions
+   * as the user types. Triggers after a brief debounce when cursor is at
+   * end of a non-empty line. The ghost text can be accepted with Tab.
+   */
+  const GhostComplete = {
+    _active: false,
+    _ghostText: "",
+    _ghostPos: -1,
+    _ghostNode: null,
+    _debounceTimer: 0,
+    _lastRequest: 0,
+    _abortController: null,
+    DEBOUNCE_MS: 650,
+    MIN_LINE_LENGTH: 4,
+    MAX_CONTEXT_CHARS: 2000,
+
+    install() {
+      if (this._active) return;
+      const view = Editor.view();
+      if (!view || !view.state || typeof view.dispatch !== "function") return;
+      this._active = true;
+      this._bindKeyHandler(view);
+      this._bindChangeHandler(view);
+    },
+
+    uninstall() {
+      this._active = false;
+      this._clearGhost();
+      if (this._debounceTimer) clearTimeout(this._debounceTimer);
+      if (this._abortController) {
+        try { this._abortController.abort(); } catch (_) {}
+      }
+      // Remove keydown handler to prevent listener accumulation
+      if (this._keyDom && this._keyHandler) {
+        this._keyDom.removeEventListener("keydown", this._keyHandler, { capture: true });
+        this._keyHandler = null;
+        this._keyDom = null;
+      }
+      // Remove editor onChange callback
+      if (this._editorChangeHandler) {
+        Editor.offChange(this._editorChangeHandler);
+        this._editorChangeHandler = null;
+      }
+    },
+
+    _bindKeyHandler(view) {
+      // Intercept Tab to accept ghost text
+      const handler = (ev) => {
+        if (!this._ghostText || !this._ghostNode) return;
+        if (ev.key === "Tab" && !ev.shiftKey && !ev.ctrlKey && !ev.altKey) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this._acceptGhost(view);
+        } else if (ev.key === "Escape") {
+          this._clearGhost();
+        }
+      };
+      const dom = view.dom || view.contentDOM;
+      if (dom) {
+        dom.addEventListener("keydown", handler, { capture: true });
+        this._keyHandler = handler;
+        this._keyDom = dom;
+      }
+    },
+
+    _bindChangeHandler(view) {
+      // Listen for document changes via EditorManager events
+      const onChange = () => {
+        if (!this._active) return;
+        this._clearGhost();
+        if (this._debounceTimer) clearTimeout(this._debounceTimer);
+        this._debounceTimer = setTimeout(() => this._tryComplete(), this.DEBOUNCE_MS);
+      };
+      this._editorChangeHandler = onChange;
+      Editor.onChange(onChange);
+    },
+
+    async _tryComplete() {
+      if (!this._active) return;
+      const settings = Store.settings();
+      if (!settings.apiKey) return;
+
+      const view = Editor.view();
+      if (!view || !view.state) return;
+
+      const text = Editor.text();
+      const cursor = Editor.cursor();
+      if (!cursor || !text) return;
+
+      // Only trigger when cursor is at end of a line with content
+      const lines = text.split("\n");
+      const currentLine = lines[cursor.line - 1] || "";
+      const lineAfterCursor = currentLine.slice(cursor.column - 1);
+      if (lineAfterCursor.trim().length > 0) return; // Cursor not at end
+      if (currentLine.trim().length < this.MIN_LINE_LENGTH) return;
+
+      // Build context: last N chars before cursor
+      const offset = Editor.offsetFromLineColumn(text, cursor.line, cursor.column);
+      const contextStart = Math.max(0, offset - this.MAX_CONTEXT_CHARS);
+      const prefix = text.slice(contextStart, offset);
+
+      // Cancel any previous request
+      if (this._abortController) {
+        try { this._abortController.abort(); } catch (_) {}
+      }
+
+      const requestId = ++this._lastRequest;
+
+      try {
+        if (typeof AbortController !== "undefined") {
+          this._abortController = new AbortController();
+        }
+
+        const baseUrl = Util.baseUrl(settings.baseUrl);
+        const payload = {
+          model: settings.model || C.DEFAULT_MODEL,
+          input: [
+            {
+              role: "system",
+              content: "You are an inline code autocomplete engine. Given the code context, predict the most likely next 1-2 lines of code. Return ONLY the completion text, no explanation, no markdown fences, no prefix repetition. If unsure, return empty string.",
+            },
+            {
+              role: "user",
+              content: "Complete this code:\n```\n" + prefix.slice(-800) + "\n```",
+            },
+          ],
+          max_output_tokens: 120,
+          temperature: 0,
+          stream: false,
+          store: false,
+        };
+
+        const res = await fetch(baseUrl + "/responses", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + settings.apiKey,
+          },
+          body: JSON.stringify(payload),
+          signal: this._abortController?.signal,
+        });
+
+        if (requestId !== this._lastRequest) return; // Stale
+        if (!res.ok) return;
+
+        const data = await res.json();
+        let completion = "";
+        if (data.output && Array.isArray(data.output)) {
+          for (const item of data.output) {
+            if (item.type === "message" && Array.isArray(item.content)) {
+              for (const part of item.content) {
+                if (part.type === "output_text" || part.type === "text") {
+                  completion += part.text || "";
+                }
+              }
+            }
+          }
+        }
+        if (!completion) completion = data.output_text || "";
+
+        // Clean completion
+        completion = completion
+          .replace(/^```[\w]*\n?/, "")
+          .replace(/\n?```$/, "")
+          .replace(/^\n/, "");
+
+        if (!completion || completion.length < 2) return;
+        if (requestId !== this._lastRequest) return;
+
+        // Show ghost text
+        this._showGhost(view, completion, offset);
+      } catch (_) {
+        // Silently ignore errors (network, abort, etc)
+      }
+    },
+
+    _showGhost(view, text, pos) {
+      this._clearGhost();
+      this._ghostText = text;
+      this._ghostPos = pos;
+
+      // Create ghost decoration via DOM overlay
+      const dom = view.dom || view.contentDOM;
+      if (!dom) return;
+
+      // Find cursor position in DOM
+      const cursorEl = dom.closest(".ace-ai-panel")
+        ? null
+        : dom.querySelector(".cm-cursor, .cm-cursor-primary, .ace_cursor");
+
+      // Create ghost span
+      const ghost = document.createElement("span");
+      ghost.className = "ace-ai-ghost-text";
+      ghost.textContent = text.split("\n")[0]; // Show first line only
+      ghost.style.cssText =
+        "color:#667085;opacity:0.6;pointer-events:none;font-style:italic;user-select:none;";
+
+      if (cursorEl) {
+        cursorEl.parentElement?.insertBefore(ghost, cursorEl.nextSibling);
+      } else {
+        // Fallback: append to active line
+        const activeLine = dom.querySelector(
+          ".cm-activeLine, .cm-line:last-child, .ace_line:last-child",
+        );
+        if (activeLine) activeLine.appendChild(ghost);
+      }
+      this._ghostNode = ghost;
+    },
+
+    _acceptGhost(view) {
+      if (!this._ghostText) return;
+      const text = this._ghostText;
+      this._clearGhost();
+      Editor.insertAtCursor(text);
+    },
+
+    _clearGhost() {
+      if (this._ghostNode) {
+        try { this._ghostNode.remove(); } catch (_) {}
+        this._ghostNode = null;
+      }
+      this._ghostText = "";
+      this._ghostPos = -1;
+    },
+  };
+
+  // ---- features/terminal-capture.js ----
+  /**
+   * Feature 2: Terminal Output Capture
+   *
+   * Enhances run_command to capture terminal output and feed it back
+   * to the agent as context for follow-up analysis.
+   */
+  const TerminalCapture = {
+    _lastOutput: "",
+    _lastCommand: "",
+    _lastExitCode: null,
+    _maxOutputChars: 8000,
+    _captureEnabled: true,
+
+    _pushHistory(cmd, output, exitCode, time) {
+      State.terminalHistory.unshift({
+        command: cmd,
+        output: (output || "").slice(0, 500),
+        exitCode: exitCode,
+        time: time,
+      });
+      State.terminalHistory = State.terminalHistory.slice(0, 10);
+    },
+
+    lastCapture() {
+      return {
+        command: this._lastCommand,
+        output: this._lastOutput,
+        exitCode: this._lastExitCode,
+        time: this._lastTime || "",
+        truncated: this._truncated || false,
+      };
+    },
+
+    contextForAgent() {
+      if (!this._lastCommand || !this._lastOutput) return "";
+      const exit = this._lastExitCode !== null ? ` (exit ${this._lastExitCode})` : "";
+      const trunc = this._truncated ? " [output truncated]" : "";
+      return [
+        "Last terminal command" + exit + trunc + ":",
+        "$ " + this._lastCommand,
+        "```",
+        this._lastOutput.slice(0, this._maxOutputChars),
+        "```",
+      ].join("\n");
+    },
+
+    async runAndCapture(command, options) {
+      const cmd = AgentTools.safeCommand(command);
+      if (!cmd) {
+        throw ErrorKit.create({
+          code: "COMMAND_BLOCKED",
+          title: "Command blocked",
+          message: "Command blocked by Ace AI safety policy: " + (command || "(empty)"),
+          hint: "Only safe lint/test/check commands are allowed.",
+        });
+      }
+
+      this._lastCommand = cmd;
+      this._lastOutput = "";
+      this._lastExitCode = null;
+      this._lastTime = new Date().toISOString();
+      this._truncated = false;
+
+      // Try to use Acode terminal with output capture
+      try {
+        // Acode's terminal API may provide output capture via callback
+        const terminal = Acode.require("terminal");
+        if (terminal && typeof terminal.run === "function") {
+          const result = await terminal.run(cmd, {
+            name: options?.name || "Ace AI",
+            capture: true,
+          });
+          if (result && typeof result === "object") {
+            this._lastOutput = String(result.output || result.stdout || "").slice(
+              0,
+              this._maxOutputChars * 2,
+            );
+            this._lastExitCode = result.exitCode ?? result.code ?? null;
+            if (this._lastOutput.length > this._maxOutputChars) {
+              this._lastOutput = this._lastOutput.slice(0, this._maxOutputChars);
+              this._truncated = true;
+            }
+            this._pushHistory(cmd, this._lastOutput, this._lastExitCode, this._lastTime);
+            return this.lastCapture();
+          }
+        }
+      } catch (_) {}
+
+      // Fallback: run visible terminal and capture what we can
+      try {
+        await Acode.runVisibleTerminal(cmd, { name: options?.name || "Ace AI Run" });
+        // Visible terminal doesn't return output directly, but we mark as executed
+        this._lastOutput = "(output captured in visible terminal tab)";
+        this._lastExitCode = null;
+      } catch (error) {
+        this._lastOutput = "Error: " + (error.message || String(error));
+        this._lastExitCode = 1;
+      }
+
+      this._pushHistory(cmd, this._lastOutput, this._lastExitCode, this._lastTime);
+
+      return this.lastCapture();
+    },
+  };
+
+  // ---- features/project-history.js ----
+  /**
+   * Feature 3: Per-Project Chat History
+   *
+   * Stores chat history separately per Project Root so users can
+   * resume conversations when switching between projects.
+   */
+  const ProjectHistory = {
+    PREFIX: "ace-ai.project-chat.",
+    MAX_PROJECTS: 8,
+    MAX_MESSAGES_PER_PROJECT: 40,
+
+    _projectKey(root) {
+      const normalized = String(root || "")
+        .trim()
+        .replace(/\\/g, "/")
+        .replace(/\/+$/, "")
+        .toLowerCase();
+      if (!normalized) return "";
+      // Create a short hash for the key
+      let hash = 0;
+      for (let i = 0; i < normalized.length; i++) {
+        hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
+      }
+      return this.PREFIX + Math.abs(hash).toString(36);
+    },
+
+    currentProjectRoot() {
+      const settings = Store.settings();
+      if (settings.projectRoot) return settings.projectRoot;
+      return AgentTools.baseDir() || "";
+    },
+
+    save(messages, projectRoot) {
+      const root = projectRoot || this.currentProjectRoot();
+      if (!root) return; // No project root — use default global chat
+      const key = this._projectKey(root);
+      if (!key) return;
+
+      const clean = (messages || [])
+        .filter((m) => m && m.role && String(m.content || "").trim())
+        .slice(-this.MAX_MESSAGES_PER_PROJECT);
+
+      Store.setJson(key, {
+        root,
+        messages: clean,
+        updatedAt: new Date().toISOString(),
+      });
+
+      // Track known project keys for cleanup
+      this._trackProject(key, root);
+    },
+
+    load(projectRoot) {
+      const root = projectRoot || this.currentProjectRoot();
+      if (!root) return [];
+      const key = this._projectKey(root);
+      if (!key) return [];
+
+      const data = Store.getJson(key, null);
+      if (!data || !Array.isArray(data.messages)) return [];
+      return data.messages;
+    },
+
+    restore(projectRoot) {
+      const messages = this.load(projectRoot);
+      if (messages.length) {
+        Store.saveChat(messages);
+        return true;
+      }
+      return false;
+    },
+
+    saveCurrentChat() {
+      const root = this.currentProjectRoot();
+      if (!root) return;
+      const chat = Store.chat();
+      if (chat.length) this.save(chat, root);
+    },
+
+    _trackProject(key, root) {
+      const indexKey = this.PREFIX + "_index";
+      const index = Store.getJson(indexKey, []);
+      const existing = index.findIndex((item) => item.key === key);
+      if (existing >= 0) {
+        index[existing].updatedAt = new Date().toISOString();
+      } else {
+        index.push({ key, root, updatedAt: new Date().toISOString() });
+      }
+      // Keep only last N projects
+      const sorted = index.sort(
+        (a, b) => new Date(b.updatedAt) - new Date(a.updatedAt),
+      );
+      const kept = sorted.slice(0, this.MAX_PROJECTS);
+      // Remove old project data
+      sorted.slice(this.MAX_PROJECTS).forEach((item) => {
+        try { localStorage.removeItem(item.key); } catch (_) {}
+      });
+      Store.setJson(indexKey, kept);
+    },
+
+    listProjects() {
+      const indexKey = this.PREFIX + "_index";
+      return Store.getJson(indexKey, []);
+    },
+
+    clearProject(projectRoot) {
+      const key = this._projectKey(projectRoot);
+      if (key) {
+        try { localStorage.removeItem(key); } catch (_) {}
+        // Also remove the entry from the _index array
+        const indexKey = this.PREFIX + "_index";
+        const index = Store.getJson(indexKey, []);
+        const filtered = index.filter((item) => item.key !== key);
+        Store.setJson(indexKey, filtered);
+      }
+    },
+  };
+
+  // ---- features/theme-system.js ----
+  /**
+   * Feature 4: Light Mode / System Theme
+   *
+   * Adds light theme support and auto-detection of system preference.
+   * User can choose: dark (default), light, or auto (system).
+   */
+  const ThemeSystem = {
+    STORAGE_KEY: "ace-ai.theme.v1",
+    _mediaQuery: null,
+    _listener: null,
+
+    current() {
+      const saved = Store.getJson(this.STORAGE_KEY, "auto");
+      if (saved === "light" || saved === "dark") return saved;
+      return this._systemPreference();
+    },
+
+    preference() {
+      return Store.getJson(this.STORAGE_KEY, "auto");
+    },
+
+    setPreference(value) {
+      const valid = ["dark", "light", "auto"];
+      const pref = valid.includes(value) ? value : "auto";
+      Store.setJson(this.STORAGE_KEY, pref);
+      this.apply();
+    },
+
+    _systemPreference() {
+      try {
+        if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+          return "light";
+        }
+      } catch (_) {}
+      return "dark";
+    },
+
+    apply() {
+      const theme = this.current();
+      const panels = document.querySelectorAll(".ace-ai-panel");
+      panels.forEach((panel) => {
+        panel.classList.toggle("ace-ai-light", theme === "light");
+        panel.classList.toggle("ace-ai-dark", theme === "dark");
+      });
+    },
+
+    applyToPanel(panel) {
+      if (!panel) return;
+      const theme = this.current();
+      panel.classList.toggle("ace-ai-light", theme === "light");
+      panel.classList.toggle("ace-ai-dark", theme === "dark");
+    },
+
+    install() {
+      this.apply();
+      // Listen for system theme changes
+      try {
+        this._mediaQuery = window.matchMedia("(prefers-color-scheme: light)");
+        this._listener = () => {
+          if (this.preference() === "auto") this.apply();
+        };
+        this._mediaQuery.addEventListener("change", this._listener);
+      } catch (_) {}
+    },
+
+    uninstall() {
+      try {
+        if (this._mediaQuery && this._listener) {
+          this._mediaQuery.removeEventListener("change", this._listener);
+        }
+      } catch (_) {}
+    },
+
+    css() {
+      if (document.getElementById("ace-ai-style-themes")) return;
+      const style = document.createElement("style");
+      style.id = "ace-ai-style-themes";
+      style.textContent = `
+  .ace-ai-panel.ace-ai-light{--ace-ai-bg:#f8f9fb;--ace-ai-surface:#ffffff;--ace-ai-surface-2:#f0f2f5;--ace-ai-border:#e2e5ea;--ace-ai-text:#1a1d23;--ace-ai-muted:#6b7280;--ace-ai-accent:#2563eb;--ace-ai-danger:#dc2626;--ace-ai-warn:#d97706;--ace-ai-ok:#16a34a;--ace-ai-code-bg:#f3f4f6}
+  .ace-ai-panel.ace-ai-light .ace-ai-head{background:#ffffff;border-bottom-color:#e2e5ea}
+  .ace-ai-panel.ace-ai-light .ace-ai-msg{background:#ffffff;border-color:#e8eaef}
+  .ace-ai-panel.ace-ai-light .ace-ai-msg.user{background:#f0f4ff;border-color:#dbe4f8}
+  .ace-ai-panel.ace-ai-light .ace-ai-msg.assistant{background:#ffffff}
+  .ace-ai-panel.ace-ai-light .ace-ai-card{background:#ffffff;border-color:#e2e5ea}
+  .ace-ai-panel.ace-ai-light .ace-ai-textarea,.ace-ai-panel.ace-ai-light .ace-ai-input{background:#f8f9fb;border-color:#e2e5ea;color:#1a1d23}
+  .ace-ai-panel.ace-ai-light .ace-ai-textarea:focus,.ace-ai-panel.ace-ai-light .ace-ai-input:focus{border-color:#2563eb}
+  .ace-ai-panel.ace-ai-light .ace-ai-chip{background:#f0f2f5;border-color:#e2e5ea;color:#374151}
+  .ace-ai-panel.ace-ai-light .ace-ai-iconbtn,.ace-ai-panel.ace-ai-light .ace-ai-btn{background:#f0f2f5;border-color:#e2e5ea;color:#374151}
+  .ace-ai-panel.ace-ai-light .ace-ai-primary{background:rgba(37,99,235,.1);border-color:rgba(37,99,235,.4);color:#1d4ed8}
+  .ace-ai-panel.ace-ai-light .ace-ai-danger{background:rgba(220,38,38,.08);border-color:rgba(220,38,38,.4);color:#b91c1c}
+  .ace-ai-panel.ace-ai-light .ace-ai-footer{background:#ffffff;border-top-color:#e2e5ea}
+  .ace-ai-panel.ace-ai-light .ace-ai-md code{background:#f3f4f6;border-color:#e5e7eb;color:#1f2937}
+  .ace-ai-panel.ace-ai-light .ace-ai-md-code{background:#f8f9fb;border-color:#e2e5ea}
+  .ace-ai-panel.ace-ai-light .ace-ai-md-code pre{color:#1f2937}
+  .ace-ai-panel.ace-ai-light .ace-ai-md-code-head{border-bottom-color:#e5e7eb;color:#6b7280}
+  .ace-ai-panel.ace-ai-light .ace-ai-diff-line.ace-ai-add{background:rgba(22,163,74,.1);color:#166534}
+  .ace-ai-panel.ace-ai-light .ace-ai-diff-line.ace-ai-del{background:rgba(220,38,38,.08);color:#991b1b}
+  .ace-ai-panel.ace-ai-light .ace-ai-diff-line.ace-ai-same{color:#6b7280}
+  .ace-ai-panel.ace-ai-light .ace-ai-tool{background:#f8f9fb;border-color:#e2e5ea}
+  .ace-ai-panel.ace-ai-light .ace-ai-loading-card{border-color:rgba(217,119,6,.3);background:rgba(217,119,6,.05)}
+  .ace-ai-panel.ace-ai-light .ace-ai-error-card{border-color:rgba(220,38,38,.4);background:rgba(220,38,38,.05)}
+  .ace-ai-panel.ace-ai-light .ace-ai-status-shimmer{color:#d97706;-webkit-text-fill-color:#d97706}
+  .ace-ai-panel.ace-ai-light .ace-ai-mini{color:#6b7280}
+  .ace-ai-panel.ace-ai-light .ace-ai-label{color:#9ca3af}
+  .ace-ai-panel.ace-ai-light .ace-ai-sub{color:#6b7280}
+  .ace-ai-panel.ace-ai-light .ace-ai-empty{border-color:#e2e5ea;color:#9ca3af}
+  .ace-ai-panel.ace-ai-light .ace-ai-context-chip{background:#f0f2f5;border-color:#e2e5ea;color:#374151}
+  .ace-ai-panel.ace-ai-light .ace-ai-hunk{background:#f8f9fb;border-color:rgba(37,99,235,.25)}
+  .ace-ai-panel.ace-ai-light .ace-ai-tool-error{background:rgba(220,38,38,.06);border-color:rgba(220,38,38,.3);color:#991b1b}
+  .ace-ai-panel.ace-ai-light .ace-ai-tool-warn{background:rgba(217,119,6,.06);border-color:rgba(217,119,6,.3);color:#92400e}
+  .ace-ai-panel.ace-ai-light .ace-ai-settings{background:#f8f9fb;border-color:#e2e5ea}
+  `;
+      document.head.appendChild(style);
+    },
+  };
+
+  // ---- features/file-index.js ----
+  /**
+   * Feature 5: File Indexing & Caching
+   *
+   * Pre-scans the project structure at startup and caches the file tree
+   * persistently. This makes list_files and search_in_files much faster
+   * on subsequent calls.
+   */
+  const FileIndex = {
+    STORAGE_PREFIX: "ace-ai.findex.",
+    _cache: null,
+    _scanning: false,
+    _lastScanRoot: "",
+    _lastScanTime: 0,
+    STALE_MS: 5 * 60 * 1000, // Re-scan after 5 minutes
+
+    cached() {
+      return this._cache;
+    },
+
+    isFresh() {
+      if (!this._cache || !this._lastScanTime) return false;
+      return Date.now() - this._lastScanTime < this.STALE_MS;
+    },
+
+    async scan(force) {
+      const root = AgentTools.baseDir();
+      if (!root) return null;
+      if (this._scanning) return this._cache;
+
+      // Return cached if fresh and same root
+      if (!force && this._cache && this._lastScanRoot === root && this.isFresh()) {
+        return this._cache;
+      }
+
+      this._scanning = true;
+      try {
+        const collected = await AgentTools.collectFiles(root, 4, "", 500);
+        this._cache = {
+          root: collected.root,
+          files: collected.files || [],
+          scannedAt: new Date().toISOString(),
+          count: (collected.files || []).length,
+        };
+        this._lastScanRoot = root;
+        this._lastScanTime = Date.now();
+
+        // Persist to localStorage for instant load next time
+        this._persist(root);
+
+        return this._cache;
+      } catch (error) {
+        // If scan fails, try to load from localStorage
+        return this._loadPersisted(root);
+      } finally {
+        this._scanning = false;
+      }
+    },
+
+    _storageKey(root) {
+      let hash = 0;
+      const str = String(root || "").toLowerCase();
+      for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+      }
+      return this.STORAGE_PREFIX + Math.abs(hash).toString(36);
+    },
+
+    _persist(root) {
+      if (!this._cache) return;
+      const key = this._storageKey(root);
+      // Only store file paths/names to save space (not content)
+      const compact = {
+        root: this._cache.root,
+        files: (this._cache.files || []).slice(0, 300).map((f) => ({
+          path: f.path,
+          name: f.name,
+          size: f.size,
+        })),
+        scannedAt: this._cache.scannedAt,
+        count: this._cache.count,
+      };
+      Store.setJson(key, compact);
+    },
+
+    _loadPersisted(root) {
+      const key = this._storageKey(root);
+      const data = Store.getJson(key, null);
+      if (data && Array.isArray(data.files)) {
+        this._cache = data;
+        this._lastScanRoot = root;
+        // Use actual scannedAt timestamp for freshness check
+        this._lastScanTime = data.scannedAt ? new Date(data.scannedAt).getTime() : 0;
+        return this._cache;
+      }
+      return null;
+    },
+
+    loadOrScan() {
+      const root = AgentTools.baseDir();
+      if (!root) return null;
+
+      // Try memory cache first
+      if (this._cache && this._lastScanRoot === root) return this._cache;
+
+      // Try localStorage
+      const persisted = this._loadPersisted(root);
+      if (persisted) {
+        // Background re-scan if stale
+        if (!this.isFresh()) {
+          setTimeout(() => this.scan(true), 1000);
+        }
+        return persisted;
+      }
+
+      // Start async scan
+      this.scan(false);
+      return null;
+    },
+
+    fileNames() {
+      if (!this._cache || !this._cache.files) return [];
+      return this._cache.files.map((f) => f.name || f.path || "");
+    },
+
+    search(query) {
+      if (!this._cache || !this._cache.files) return [];
+      const q = String(query || "").toLowerCase();
+      if (!q) return [];
+      return this._cache.files
+        .filter((f) => {
+          const name = String(f.name || f.path || "").toLowerCase();
+          return name.includes(q);
+        })
+        .slice(0, 30);
+    },
+
+    invalidate() {
+      this._cache = null;
+      this._lastScanTime = 0;
+    },
+  };
+
+  // ---- features/voice-input.js ----
+  /**
+   * Feature 6: Voice Input
+   *
+   * Adds a microphone button that uses Android's native speech-to-text
+   * (Web Speech API / SpeechRecognition) to transcribe voice into the
+   * prompt textarea.
+   */
+  const VoiceInput = {
+    _recognition: null,
+    _listening: false,
+    _supported: false,
+
+    isSupported() {
+      if (this._supported) return true;
+      this._supported = Boolean(
+        window.SpeechRecognition ||
+        window.webkitSpeechRecognition ||
+        window.mozSpeechRecognition,
+      );
+      return this._supported;
+    },
+
+    isListening() {
+      return this._listening;
+    },
+
+    start(onResult, onEnd) {
+      if (!this.isSupported()) {
+        Acode.toast("Voice input not supported in this WebView");
+        return false;
+      }
+      if (this._listening) {
+        this.stop();
+        return false;
+      }
+
+      const SpeechRecognition =
+        window.SpeechRecognition ||
+        window.webkitSpeechRecognition ||
+        window.mozSpeechRecognition;
+
+      this._recognition = new SpeechRecognition();
+      this._recognition.continuous = false;
+      this._recognition.interimResults = true;
+      this._recognition.lang = navigator.language || "en-US";
+      this._recognition.maxAlternatives = 1;
+
+      this._recognition.onresult = (event) => {
+        let transcript = "";
+        let isFinal = false;
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          transcript += event.results[i][0].transcript;
+          if (event.results[i].isFinal) isFinal = true;
+        }
+        if (typeof onResult === "function") onResult(transcript, isFinal);
+      };
+
+      this._recognition.onerror = (event) => {
+        const msg = event.error === "no-speech"
+          ? "No speech detected"
+          : event.error === "not-allowed"
+            ? "Microphone permission denied"
+            : "Voice error: " + (event.error || "unknown");
+        Acode.toast(msg);
+        this._listening = false;
+        if (typeof onEnd === "function") onEnd();
+      };
+
+      this._recognition.onend = () => {
+        this._listening = false;
+        if (typeof onEnd === "function") onEnd();
+      };
+
+      try {
+        this._recognition.start();
+        this._listening = true;
+        return true;
+      } catch (error) {
+        Acode.toast("Voice start failed: " + (error.message || error));
+        this._listening = false;
+        return false;
+      }
+    },
+
+    stop() {
+      if (this._recognition) {
+        try { this._recognition.stop(); } catch (_) {}
+      }
+      this._listening = false;
+    },
+
+    toggle(onResult, onEnd) {
+      if (this._listening) {
+        this.stop();
+        return false;
+      }
+      return this.start(onResult, onEnd);
+    },
+
+    buttonHtml() {
+      if (!this.isSupported()) return "";
+      const active = this._listening ? " active" : "";
+      return `<button class="ace-ai-chip ace-ai-voice-btn${active}" data-act="voice-input" aria-label="Voice input" title="Tap to speak">${this._listening ? "🔴" : "🎤"}</button>`;
+    },
+  };
+
+  // ---- features/mobile-ux.js ----
+  /**
+   * Feature 7: Mobile UX Improvements
+   *
+   * Adds swipe gestures, haptic feedback, compact mode detection,
+   * and floating bubble for quick access.
+   */
+  const MobileUX = {
+    _swipeStartX: 0,
+    _swipeStartY: 0,
+    _swipeThreshold: 80,
+    _compact: false,
+    _bubble: null,
+    _handlers: [],
+
+    isCompact() {
+      return window.innerWidth < 380 || window.innerHeight < 640;
+    },
+
+    haptic(type) {
+      try {
+        if (navigator.vibrate) {
+          if (type === "light") navigator.vibrate(10);
+          else if (type === "medium") navigator.vibrate(25);
+          else if (type === "heavy") navigator.vibrate([30, 10, 30]);
+          else navigator.vibrate(15);
+        }
+      } catch (_) {}
+    },
+
+    installSwipe(root) {
+      if (!root) return;
+      const onTouchStart = (ev) => {
+        const touch = ev.touches[0];
+        if (!touch) return;
+        this._swipeStartX = touch.clientX;
+        this._swipeStartY = touch.clientY;
+      };
+
+      const onTouchEnd = (ev) => {
+        const touch = ev.changedTouches[0];
+        if (!touch) return;
+        const dx = touch.clientX - this._swipeStartX;
+        const dy = touch.clientY - this._swipeStartY;
+        const absDx = Math.abs(dx);
+        const absDy = Math.abs(dy);
+
+        // Only handle horizontal swipes that are clearly horizontal
+        if (absDx < this._swipeThreshold || absDy > absDx * 0.6) return;
+
+        // Don't interfere with scroll areas
+        const target = ev.target;
+        if (target?.closest?.(".ace-ai-chatlog, .ace-ai-conversation, .ace-ai-tool-diff")) return;
+
+        if (dx > 0) {
+          // Swipe right — go back / close panel
+          this.haptic("light");
+          UI.handleBackAction();
+        } else {
+          // Swipe left — open review if tools are pending
+          if (State.pendingTools.length) {
+            this.haptic("light");
+            State.activeTab = "changes";
+            UI.render(root);
+          }
+        }
+      };
+
+      root.addEventListener("touchstart", onTouchStart, { passive: true });
+      root.addEventListener("touchend", onTouchEnd, { passive: true });
+      this._handlers.push(
+        [root, "touchstart", onTouchStart],
+        [root, "touchend", onTouchEnd],
+      );
+    },
+
+    installCompactMode(root) {
+      if (!root) return;
+      const check = () => {
+        const compact = this.isCompact();
+        root.classList.toggle("ace-ai-compact-device", compact);
+        this._compact = compact;
+      };
+      check();
+      const handler = Util.debounce(check, 300);
+      window.addEventListener("resize", handler);
+      this._handlers.push([window, "resize", handler]);
+    },
+
+    installBubble() {
+      // Floating action bubble — alternative to side button
+      if (this._bubble) return;
+      const bubble = document.createElement("button");
+      bubble.className = "ace-ai-bubble";
+      bubble.textContent = "✦";
+      bubble.setAttribute("aria-label", "Open Ace AI");
+      bubble.style.cssText = `
+        position:fixed;right:12px;bottom:90px;z-index:2147483000;
+        width:44px;height:44px;border-radius:50%;border:1px solid rgba(77,163,255,.5);
+        background:rgba(15,17,23,.95);color:#4da3ff;font-size:18px;font-weight:900;
+        box-shadow:0 4px 20px rgba(0,0,0,.4);touch-action:manipulation;
+        display:flex;align-items:center;justify-content:center;
+        transition:transform .15s ease,box-shadow .15s ease;
+      `;
+      bubble.addEventListener("click", () => {
+        this.haptic("medium");
+        UI.openPanel("chat");
+      });
+
+      // Make it draggable
+      let dragging = false;
+      let offsetY = 0;
+      bubble.addEventListener("touchstart", (ev) => {
+        const touch = ev.touches[0];
+        offsetY = touch.clientY - bubble.getBoundingClientRect().top;
+        dragging = false;
+      }, { passive: true });
+      bubble.addEventListener("touchmove", (ev) => {
+        dragging = true;
+        const touch = ev.touches[0];
+        const y = Math.max(20, Math.min(window.innerHeight - 60, touch.clientY - offsetY));
+        bubble.style.bottom = "auto";
+        bubble.style.top = y + "px";
+        ev.preventDefault();
+      }, { passive: false });
+      bubble.addEventListener("touchend", () => {
+        if (dragging) {
+          dragging = false;
+          return;
+        }
+      });
+
+      document.body.appendChild(bubble);
+      this._bubble = bubble;
+    },
+
+    removeBubble() {
+      if (this._bubble) {
+        try { this._bubble.remove(); } catch (_) {}
+        this._bubble = null;
+      }
+    },
+
+    css() {
+      if (document.getElementById("ace-ai-style-mobile-ux")) return;
+      const style = document.createElement("style");
+      style.id = "ace-ai-style-mobile-ux";
+      style.textContent = `
+  .ace-ai-compact-device .ace-ai-msg{padding:8px;font-size:12px}
+  .ace-ai-compact-device .ace-ai-card{padding:8px}
+  .ace-ai-compact-device .ace-ai-textarea{min-height:36px;max-height:68px;font-size:12px}
+  .ace-ai-compact-device .ace-ai-chip{padding:5px 8px;font-size:11px}
+  .ace-ai-compact-device .ace-ai-iconbtn{min-width:32px;min-height:32px}
+  .ace-ai-compact-device .ace-ai-brand{font-size:13px}
+  .ace-ai-compact-device .ace-ai-head{padding:7px 9px}
+  .ace-ai-voice-btn{display:inline-flex;align-items:center;gap:4px}
+  .ace-ai-voice-btn.active{border-color:rgba(220,38,38,.6);background:rgba(220,38,38,.12);animation:ace-ai-pulse 1.1s ease-in-out infinite}
+  .ace-ai-bubble{cursor:pointer}
+  .ace-ai-bubble:active{transform:scale(.9);box-shadow:0 2px 10px rgba(0,0,0,.3)}
+  `;
+      document.head.appendChild(style);
+    },
+
+    cleanup() {
+      this._handlers.forEach(([el, event, fn]) => {
+        try { el.removeEventListener(event, fn); } catch (_) {}
+      });
+      this._handlers = [];
+      this.removeBubble();
+    },
+  };
+
+  // ---- features/intent-handler.js ----
+  /**
+   * Feature 8: Intent API Integration
+   *
+   * Handles share-to-Ace-AI intents and custom URL schemes
+   * so users can share error logs from other apps or trigger
+   * commands via deep links.
+   */
+  const IntentHandler = {
+    _installed: false,
+    SCHEME: "aceai",
+
+    install() {
+      if (this._installed) return;
+      this._installed = true;
+
+      // Register intent handler with Acode's Intent API
+      try {
+        const intent = Acode.require("intent");
+        if (intent && typeof intent.onShare === "function") {
+          intent.onShare(this._handleShare.bind(this));
+        }
+        if (intent && typeof intent.onUri === "function") {
+          intent.onUri(this._handleUri.bind(this));
+        }
+      } catch (_) {}
+
+      // Also listen for custom URL via Acode's global
+      try {
+        if (window.acode && typeof window.acode.onIntent === "function") {
+          window.acode.onIntent(C.PLUGIN_ID, this._handleIntent.bind(this));
+        }
+      } catch (_) {}
+    },
+
+    _handleShare(data) {
+      // data.text contains shared text from another app
+      const text = String(data?.text || data?.content || data || "").trim();
+      if (!text) return;
+
+      // Open Ace AI with the shared content as context
+      const prompt = text.length > 500
+        ? "Analyze this shared content:\n\n" + text.slice(0, 2000)
+        : "Explain and help with this:\n\n" + text;
+
+      UI.openPanel("chat", "agent");
+      State.draftPrompt = prompt;
+      setTimeout(() => {
+        const input = State.panel?.querySelector('[data-role="prompt"]');
+        if (input) {
+          input.value = prompt;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      }, 100);
+      Acode.toast("Shared content loaded into Ace AI");
+    },
+
+    _handleUri(uri) {
+      // Handle aceai:// scheme URLs
+      const url = String(uri || "").trim();
+      if (!url.startsWith(this.SCHEME + "://")) return;
+
+      const path = url.slice((this.SCHEME + "://").length);
+      const [action, ...params] = path.split("/");
+      const query = params.join("/");
+
+      this._executeAction(action, query);
+    },
+
+    _handleIntent(data) {
+      // Generic intent handler
+      if (data?.action === "share") return this._handleShare(data);
+      if (data?.uri) return this._handleUri(data.uri);
+      if (data?.command) this._executeAction(data.command, data.query || "");
+    },
+
+    _executeAction(action, query) {
+      const act = String(action || "").toLowerCase().trim();
+
+      switch (act) {
+        case "open":
+          UI.openPanel("chat");
+          break;
+
+        case "fix":
+          UI.openPanel("chat", "agent", "Fix the selected code. Keep the change minimal.");
+          break;
+
+        case "explain":
+          UI.openPanel("chat", "agent", "Explain the selected code/error.");
+          break;
+
+        case "diagnose":
+          UI.openPanel("chat", "agent",
+            "Diagnose this project. Use project_overview first, then inspect only the files needed.");
+          break;
+
+        case "review":
+          UI.openPanel("chat", "agent",
+            "Review the current file for bugs and improvements. Do not edit yet.");
+          break;
+
+        case "ask":
+          if (query) {
+            UI.openPanel("chat", "agent");
+            let decodedQuery;
+            try {
+              decodedQuery = decodeURIComponent(query);
+            } catch (_) {
+              decodedQuery = query;
+            }
+            State.draftPrompt = decodedQuery;
+            setTimeout(() => {
+              const input = State.panel?.querySelector('[data-role="prompt"]');
+              if (input) {
+                input.value = State.draftPrompt;
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+              }
+            }, 100);
+          } else {
+            UI.openPanel("chat");
+          }
+          break;
+
+        case "lint":
+          UI.openPanel("chat", "agent");
+          UI.requestRunCommand(State.panel, "npm run lint");
+          break;
+
+        case "test":
+          UI.openPanel("chat", "agent");
+          UI.requestRunCommand(State.panel, "npm test");
+          break;
+
+        default:
+          UI.openPanel("chat");
+          if (query) {
+            let decodedDefault;
+            try {
+              decodedDefault = decodeURIComponent(query);
+            } catch (_) {
+              decodedDefault = query;
+            }
+            State.draftPrompt = decodedDefault;
+          }
+      }
+    },
+
+    uninstall() {
+      this._installed = false;
+    },
+  };
+
   // ---- ui/templates.js ----
   const Templates = {
     neosantaraHtml(widgetId) {
@@ -6687,11 +7897,12 @@
       if (!asSidebar) State.panel = panel;
       this.bind(panel);
       this.render(panel);
+      ThemeSystem.applyToPanel(panel);
       return panel;
     },
     layout() {
       return `
-  <div class="ace-ai-head"><div class="ace-ai-head-main"><div class="ace-ai-brand-wrap"><img class="ace-ai-brand-logo" src="${ACE_AI_LOGO}" alt="Ace AI logo"><div><div class="ace-ai-brand">Ace AI <span class="ace-ai-mini">v${C.VERSION}</span></div><div class="ace-ai-sub" data-role="context-line">Acode-native AI coding assistant</div></div></div></div><div class="ace-ai-actions"><button class="ace-ai-iconbtn" data-act="quick-menu">⋮</button><button class="ace-ai-iconbtn" data-act="settings">⚙</button><button class="ace-ai-iconbtn" data-act="toggle-max">⤢</button><button class="ace-ai-iconbtn" data-act="close">×</button></div></div>
+  <div class="ace-ai-head"><div class="ace-ai-head-main"><div class="ace-ai-brand-wrap"><img class="ace-ai-brand-logo" src="${ACE_AI_LOGO}" alt="Ace AI logo"><div><div class="ace-ai-brand">Ace AI <span class="ace-ai-mini">v${C.VERSION}</span></div><div class="ace-ai-sub" data-role="context-line">Acode-native AI coding assistant</div></div></div></div><div class="ace-ai-actions"><button class="ace-ai-iconbtn" data-act="quick-menu" aria-label="Quick menu">⋮</button><button class="ace-ai-iconbtn" data-act="settings" aria-label="Settings">⚙</button><button class="ace-ai-iconbtn" data-act="toggle-max" aria-label="Maximize">⤢</button><button class="ace-ai-iconbtn" data-act="close" aria-label="Close panel">×</button></div></div>
   <div class="ace-ai-tabs"><button class="ace-ai-tab" data-tab="chat">Chat</button><button class="ace-ai-tab" data-tab="edit">Edit</button><button class="ace-ai-tab" data-tab="agent">Agent</button><button class="ace-ai-tab" data-tab="changes">Review</button></div>
   <div class="ace-ai-body"><div data-view="chat"></div><div data-view="edit"></div><div data-view="agent"></div><div data-view="changes"></div></div>
   <div class="ace-ai-footer" data-role="footer"></div>
@@ -6798,6 +8009,7 @@
         this.mountPanel(wrap, false);
       }
       State.panel.classList.remove("ace-ai-hidden");
+      ThemeSystem.applyToPanel(State.panel);
       if (mode) State.activeMode = mode;
       if (tab) State.activeTab = tab;
       this.render(State.panel);
@@ -7052,10 +8264,17 @@
             v.dataset.view === State.activeTab,
           ),
         );
-      this.renderChat(root.querySelector('[data-view="chat"]'));
-      this.renderEdit(root.querySelector('[data-view="edit"]'));
-      this.renderAgent(root.querySelector('[data-view="agent"]'));
-      this.renderChanges(root.querySelector('[data-view="changes"]'));
+      // Lazy render: only render the active view + settings to avoid unnecessary
+      // DOM thrashing on hidden tabs. Other views render when switched to.
+      const active = State.activeTab || "chat";
+      if (active === "chat")
+        this.renderChat(root.querySelector('[data-view="chat"]'));
+      else if (active === "edit")
+        this.renderEdit(root.querySelector('[data-view="edit"]'));
+      else if (active === "agent")
+        this.renderAgent(root.querySelector('[data-view="agent"]'));
+      else if (active === "changes")
+        this.renderChanges(root.querySelector('[data-view="changes"]'));
       this.renderSettings(root.querySelector('[data-role="settings"]'));
       this.updateFooter(root);
       this.scrollChatToBottom(root);
@@ -7379,7 +8598,7 @@
     renderSettings(el) {
       if (!el) return;
       const s = Store.settings();
-      el.innerHTML = `<div class="ace-ai-col"><div class="ace-ai-row" style="justify-content:space-between"><div class="ace-ai-brand">Settings</div><button class="ace-ai-iconbtn" data-act="settings">×</button></div><label><div class="ace-ai-label">NAI API Key</div><input class="ace-ai-input" data-set="apiKey" type="password" value="${Util.html(s.apiKey)}" placeholder="nsk_..."></label><label><div class="ace-ai-label">Base URL</div><input class="ace-ai-input" data-set="baseUrl" value="${Util.html(s.baseUrl)}"></label><div class="ace-ai-mini">Endpoint: /v1/responses only. Ace AI stores previous_response_id for conversation continuity and also keeps local history on this device.</div><label><div class="ace-ai-label">Model</div><input class="ace-ai-input" data-set="model" value="${Util.html(s.model)}"></label><label><div class="ace-ai-label">Project Root / Folder URL</div><input class="ace-ai-input" data-set="projectRoot" value="${Util.html(s.projectRoot || "")}" placeholder="optional, e.g. content://... or file:///storage/..."></label><div class="ace-ai-mini">Used when the agent creates relative files such as index.js and the active file does not already have a folder.</div><div class="ace-ai-row"><label style="flex:1"><div class="ace-ai-label">Temperature</div><input class="ace-ai-input" data-set="temperature" value="${Util.html(s.temperature)}"></label><label style="flex:1"><div class="ace-ai-label">Max Tokens</div><input class="ace-ai-input" data-set="maxTokens" value="${Util.html(s.maxTokens)}"></label></div><label class="ace-ai-chip"><input type="checkbox" data-set="includeFullFile" ${s.includeFullFile ? "checked" : ""}> Include full file by default</label><label class="ace-ai-chip"><input type="checkbox" data-set="preferPatch" ${s.preferPatch ? "checked" : ""}> Prefer patch output</label><button class="ace-ai-btn ace-ai-primary" data-act="save-settings">Save Settings</button><div class="ace-ai-row"><button class="ace-ai-btn" data-act="copy-debug">Copy Debug State</button><button class="ace-ai-btn" data-act="new-chat">Clear Chat History</button><button class="ace-ai-btn ace-ai-danger" data-act="clear-state">Clear Runtime State</button></div></div>`;
+      el.innerHTML = `<div class="ace-ai-col"><div class="ace-ai-row" style="justify-content:space-between"><div class="ace-ai-brand">Settings</div><button class="ace-ai-iconbtn" data-act="settings" aria-label="Close settings">×</button></div><label><div class="ace-ai-label">NAI API Key</div><input class="ace-ai-input" data-set="apiKey" type="password" value="${Util.html(s.apiKey)}" placeholder="nsk_..."></label><label><div class="ace-ai-label">Base URL</div><input class="ace-ai-input" data-set="baseUrl" value="${Util.html(s.baseUrl)}"></label><div class="ace-ai-mini">Endpoint: /v1/responses only. Ace AI stores previous_response_id for conversation continuity and also keeps local history on this device.</div><label><div class="ace-ai-label">Model</div><input class="ace-ai-input" data-set="model" value="${Util.html(s.model)}"></label><label><div class="ace-ai-label">Project Root / Folder URL</div><input class="ace-ai-input" data-set="projectRoot" value="${Util.html(s.projectRoot || "")}" placeholder="optional, e.g. content://... or file:///storage/..."></label><div class="ace-ai-mini">Used when the agent creates relative files such as index.js and the active file does not already have a folder.</div><div class="ace-ai-row"><label style="flex:1"><div class="ace-ai-label">Temperature</div><input class="ace-ai-input" data-set="temperature" value="${Util.html(s.temperature)}"></label><label style="flex:1"><div class="ace-ai-label">Max Tokens</div><input class="ace-ai-input" data-set="maxTokens" value="${Util.html(s.maxTokens)}"></label></div><label class="ace-ai-chip"><input type="checkbox" data-set="includeFullFile" ${s.includeFullFile ? "checked" : ""}> Include full file by default</label><label class="ace-ai-chip"><input type="checkbox" data-set="preferPatch" ${s.preferPatch ? "checked" : ""}> Prefer patch output</label><button class="ace-ai-btn ace-ai-primary" data-act="save-settings">Save Settings</button><div class="ace-ai-row"><button class="ace-ai-btn" data-act="copy-debug">Copy Debug State</button><button class="ace-ai-btn" data-act="new-chat">Clear Chat History</button><button class="ace-ai-btn ace-ai-danger" data-act="clear-state">Clear Runtime State</button></div></div>`;
     },
     attachHints(input) {
       // Acode inputHints opens a large native dropdown on some Android builds and
@@ -8190,6 +9409,7 @@
       if (mode === "ask" || mode === "chat" || mode === "edit") mode = "agent";
       const permission =
         State.permissionMode || Store.settings().permissionMode || "safe";
+      const themePref = ThemeSystem.preference();
       return `<details class="ace-ai-options"><summary>Options · ${Util.html(mode === "plan" ? "Plan" : "Agent")} · ${Util.html(permission)}</summary><div class="ace-ai-toolbar">
           <label><span>Mode</span><select class="ace-ai-select ace-ai-mini-select" data-role="ai-mode">
             <option value="agent" ${mode !== "plan" ? "selected" : ""}>Agent</option>
@@ -8199,6 +9419,11 @@
             <option value="safe" ${permission === "safe" ? "selected" : ""}>Safe</option>
             <option value="balanced" ${permission === "balanced" ? "selected" : ""}>Balanced</option>
             <option value="autopilot" ${permission === "autopilot" ? "selected" : ""}>Autopilot</option>
+          </select></label>
+          <label><span>Theme</span><select class="ace-ai-select ace-ai-mini-select" data-role="theme-mode">
+            <option value="auto" ${themePref === "auto" ? "selected" : ""}>Auto</option>
+            <option value="dark" ${themePref === "dark" ? "selected" : ""}>Dark</option>
+            <option value="light" ${themePref === "light" ? "selected" : ""}>Light</option>
           </select></label>
           <label class="ace-ai-chip ace-ai-include-full"><input type="checkbox" data-role="include-full" ${Store.settings().includeFullFile ? "checked" : ""}> Include full file</label>
         </div></details>`;
@@ -8219,7 +9444,7 @@
       const checkCmd = /^[\w./-]+\.m?js$/i.test(currentFile)
         ? `node --check ${currentFile}`
         : "npm run lint";
-      return `<div class="ace-ai-row nowrap ace-ai-action-chips">${items}<button class="ace-ai-chip" data-act="attach-current-file">Attach file</button><button class="ace-ai-chip" data-tool="agent-codebase">@codebase</button><button class="ace-ai-chip" data-tool="agent-review-file">Review file</button><button class="ace-ai-chip" data-tool="agent-diagnose">Diagnose</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm run lint">Run lint</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm test">Run tests</button><button class="ace-ai-chip" data-act="run-command" data-cmd="${Util.html(checkCmd)}">Syntax</button></div>`;
+      return `<div class="ace-ai-row nowrap ace-ai-action-chips">${items}${VoiceInput.buttonHtml()}<button class="ace-ai-chip" data-act="attach-current-file">Attach file</button><button class="ace-ai-chip" data-tool="agent-codebase">@codebase</button><button class="ace-ai-chip" data-tool="agent-review-file">Review file</button><button class="ace-ai-chip" data-tool="agent-diagnose">Diagnose</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm run lint">Run lint</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm test">Run tests</button><button class="ace-ai-chip" data-act="run-command" data-cmd="${Util.html(checkCmd)}">Syntax</button></div>`;
     },
     contextStrip() {
       const ctx = Editor.context();
@@ -8507,12 +9732,14 @@
       }
       this.bind(root);
       this.render(root);
+      MobileUX.installSwipe(root);
+      MobileUX.installCompactMode(root);
       return root;
     };
 
     UI.shell = function () {
       return `<div class="ace-ai-panel ace-ai-hidden">
-  <div class="ace-ai-head"><div class="ace-ai-head-main"><div class="ace-ai-brand-wrap"><img class="ace-ai-brand-logo" src="data:image/png;base64,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" alt="Ace AI logo"><div><div class="ace-ai-brand">Ace AI <span class="ace-ai-mini">v${C.VERSION}</span></div><div class="ace-ai-sub" data-role="context-line">Agent · review before apply</div></div></div></div><div class="ace-ai-actions"><button class="ace-ai-iconbtn ace-ai-header-new" data-act="new-chat" title="Start a clean chat">＋</button><button class="ace-ai-iconbtn" data-act="quick-menu" title="Quick menu">⋮</button><button class="ace-ai-iconbtn" data-act="settings" title="Settings">⚙</button><button class="ace-ai-iconbtn" data-act="toggle-max" title="Maximize">⤢</button><button class="ace-ai-iconbtn" data-act="close" title="Close">×</button></div></div>
+  <div class="ace-ai-head"><div class="ace-ai-head-main"><div class="ace-ai-brand-wrap"><img class="ace-ai-brand-logo" src="data:image/png;base64,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" alt="Ace AI logo"><div><div class="ace-ai-brand">Ace AI <span class="ace-ai-mini">v${C.VERSION}</span></div><div class="ace-ai-sub" data-role="context-line">Agent · review before apply</div></div></div></div><div class="ace-ai-actions"><button class="ace-ai-iconbtn ace-ai-header-new" data-act="new-chat" title="Start a clean chat" aria-label="New chat">＋</button><button class="ace-ai-iconbtn" data-act="quick-menu" title="Quick menu" aria-label="Quick menu">⋮</button><button class="ace-ai-iconbtn" data-act="settings" title="Settings" aria-label="Settings">⚙</button><button class="ace-ai-iconbtn" data-act="toggle-max" title="Maximize" aria-label="Maximize">⤢</button><button class="ace-ai-iconbtn" data-act="close" title="Close" aria-label="Close panel">×</button></div></div>
   <div class="ace-ai-tabs"></div>
   <div class="ace-ai-body"><div data-view="chat"></div></div>
   <div class="ace-ai-footer" data-role="footer"></div>
@@ -8728,6 +9955,20 @@
         State.flowDetail = "";
         return this.render(root);
       }
+      if (act === "voice-input") {
+        const textarea = root.querySelector('[data-role="prompt"]');
+        VoiceInput.toggle(
+          (transcript, isFinal) => {
+            if (textarea) {
+              textarea.value = (State.draftPrompt || "") + transcript;
+              if (isFinal) State.draftPrompt = textarea.value;
+            }
+          },
+          () => this.render(root),
+        );
+        this.render(root);
+        return;
+      }
       const out = await baseHandle(act, root);
       State.activeTab = "chat";
       return out;
@@ -8745,6 +9986,8 @@
       )
         State.aiMode = "agent";
       if (permSelect) State.permissionMode = permSelect.value || "safe";
+      const themeSelect = root.querySelector('[data-role="theme-mode"]');
+      if (themeSelect) ThemeSystem.setPreference(themeSelect.value || "auto");
       Store.saveSettings({
         agentMode: State.aiMode,
         permissionMode: State.permissionMode,
@@ -9205,23 +10448,39 @@
       this.ensureSelectionMenuCompactCss();
       if (State.selectionMenuObserver) return;
       const run = () => this.sanitizeSelectionMenuDom();
+      // Throttle: run at most once per 150ms to avoid excessive DOM queries
+      // on every mutation in the document body.
+      let pending = false;
+      let lastRun = 0;
+      const THROTTLE_MS = 150;
+      const throttledRun = () => {
+        if (pending) return;
+        const elapsed = Date.now() - lastRun;
+        if (elapsed >= THROTTLE_MS) {
+          lastRun = Date.now();
+          run();
+        } else {
+          pending = true;
+          setTimeout(() => {
+            pending = false;
+            lastRun = Date.now();
+            run();
+          }, THROTTLE_MS - elapsed);
+        }
+      };
       try {
-        const observer = new window.MutationObserver(() => {
-          try {
-            requestAnimationFrame(run);
-          } catch (_) {
-            setTimeout(run, 0);
-          }
-        });
+        const observer = new window.MutationObserver(throttledRun);
         observer.observe(document.body, { childList: true, subtree: true });
         State.selectionMenuObserver = observer;
       } catch (_) {}
       try {
-        document.addEventListener("selectionchange", run, { passive: true });
-        State.selectionMenuSanitizer = run;
+        document.addEventListener("selectionchange", throttledRun, {
+          passive: true,
+        });
+        State.selectionMenuSanitizer = throttledRun;
       } catch (_) {}
       run();
-      [20, 120, 350, 800, 1500].forEach((delay) => {
+      [120, 800, 1500].forEach((delay) => {
         try {
           setTimeout(run, delay);
         } catch (_) {}
@@ -9455,15 +10714,105 @@
           monochrome: false,
         });
     } catch (_) {}
-    Runtime.clearTransientState();
-    PermissionModel.resetSession();
-    Page.render($page);
-    Native.install();
-    Acode.toast("Ace AI v" + C.VERSION + " ready");
+    const errors = [];
+    try {
+      Runtime.clearTransientState();
+    } catch (e) {
+      errors.push("Runtime: " + (e.message || e));
+    }
+    try {
+      PermissionModel.resetSession();
+    } catch (e) {
+      errors.push("Permission: " + (e.message || e));
+    }
+    try {
+      Page.render($page);
+    } catch (e) {
+      errors.push("Page: " + (e.message || e));
+    }
+    try {
+      Native.install();
+    } catch (e) {
+      errors.push("Native: " + (e.message || e));
+    }
+    try {
+      ThemeSystem.css();
+      ThemeSystem.install();
+    } catch (e) {
+      errors.push("Theme: " + (e.message || e));
+    }
+    try {
+      MobileUX.css();
+      MobileUX.installBubble();
+    } catch (e) {
+      errors.push("MobileUX: " + (e.message || e));
+    }
+    try {
+      IntentHandler.install();
+    } catch (e) {
+      errors.push("Intent: " + (e.message || e));
+    }
+    try {
+      FileIndex.loadOrScan();
+    } catch (e) {
+      errors.push("FileIndex: " + (e.message || e));
+    }
+    try {
+      // Restore project-specific chat history if available
+      const restored = ProjectHistory.restore();
+      if (restored) State.projectHistoryRestored = true;
+    } catch (e) {
+      errors.push("ProjectHistory: " + (e.message || e));
+    }
+    try {
+      GhostComplete.install();
+    } catch (e) {
+      errors.push("GhostComplete: " + (e.message || e));
+    }
+    if (errors.length) {
+      Acode.toast(
+        "Ace AI v" +
+          C.VERSION +
+          " partially loaded (" +
+          errors.length +
+          " warning" +
+          (errors.length > 1 ? "s" : "") +
+          ")",
+      );
+      console.warn("Ace AI init warnings:", errors);
+    } else {
+      Acode.toast("Ace AI v" + C.VERSION + " ready");
+    }
   }
 
   function unmount() {
-    Native.cleanup();
+    try {
+      // Save project chat before cleanup
+      ProjectHistory.saveCurrentChat();
+    } catch (_) {}
+    try {
+      GhostComplete.uninstall();
+    } catch (_) {}
+    try {
+      ThemeSystem.uninstall();
+    } catch (_) {}
+    try {
+      MobileUX.cleanup();
+    } catch (_) {}
+    try {
+      IntentHandler.uninstall();
+    } catch (_) {}
+    try {
+      VoiceInput.stop();
+    } catch (_) {}
+    try {
+      Native.cleanup();
+    } catch (e) {
+      console.warn("Ace AI unmount error:", e.message || e);
+    }
+    try {
+      if (State._abortController) State._abortController.abort();
+    } catch (_) {}
   }
 
   if (window.acode && typeof window.acode.setPluginInit === "function") {

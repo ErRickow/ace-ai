@@ -29,6 +29,40 @@ function init(baseUrl, $page, cache) {
   } catch (e) {
     errors.push("Native: " + (e.message || e));
   }
+  try {
+    ThemeSystem.css();
+    ThemeSystem.install();
+  } catch (e) {
+    errors.push("Theme: " + (e.message || e));
+  }
+  try {
+    MobileUX.css();
+    MobileUX.installBubble();
+  } catch (e) {
+    errors.push("MobileUX: " + (e.message || e));
+  }
+  try {
+    IntentHandler.install();
+  } catch (e) {
+    errors.push("Intent: " + (e.message || e));
+  }
+  try {
+    FileIndex.loadOrScan();
+  } catch (e) {
+    errors.push("FileIndex: " + (e.message || e));
+  }
+  try {
+    // Restore project-specific chat history if available
+    const restored = ProjectHistory.restore();
+    if (restored) State.projectHistoryRestored = true;
+  } catch (e) {
+    errors.push("ProjectHistory: " + (e.message || e));
+  }
+  try {
+    GhostComplete.install();
+  } catch (e) {
+    errors.push("GhostComplete: " + (e.message || e));
+  }
   if (errors.length) {
     Acode.toast(
       "Ace AI v" +
@@ -46,6 +80,25 @@ function init(baseUrl, $page, cache) {
 }
 
 function unmount() {
+  try {
+    // Save project chat before cleanup
+    ProjectHistory.saveCurrentChat();
+  } catch (_) {}
+  try {
+    GhostComplete.uninstall();
+  } catch (_) {}
+  try {
+    ThemeSystem.uninstall();
+  } catch (_) {}
+  try {
+    MobileUX.cleanup();
+  } catch (_) {}
+  try {
+    IntentHandler.uninstall();
+  } catch (_) {}
+  try {
+    VoiceInput.stop();
+  } catch (_) {}
   try {
     Native.cleanup();
   } catch (e) {

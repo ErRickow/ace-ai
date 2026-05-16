@@ -136,6 +136,10 @@ const Prompt = {
       user +=
         "The user referenced files with @file syntax. Use read_file for those paths before making assumptions if the contents are not already in context.\n\n";
     }
+    if (TerminalCapture.lastCapture().output) {
+      const termCtx = TerminalCapture.contextForAgent();
+      if (termCtx) user += termCtx + "\n\n";
+    }
     if (attachments.length) {
       user += "Pinned context snapshots from the user:\n";
       attachments.forEach((item, index) => {

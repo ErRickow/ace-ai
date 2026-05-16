@@ -155,6 +155,7 @@ const V8 = {
     if (mode === "ask" || mode === "chat" || mode === "edit") mode = "agent";
     const permission =
       State.permissionMode || Store.settings().permissionMode || "safe";
+    const themePref = ThemeSystem.preference();
     return `<details class="ace-ai-options"><summary>Options · ${Util.html(mode === "plan" ? "Plan" : "Agent")} · ${Util.html(permission)}</summary><div class="ace-ai-toolbar">
         <label><span>Mode</span><select class="ace-ai-select ace-ai-mini-select" data-role="ai-mode">
           <option value="agent" ${mode !== "plan" ? "selected" : ""}>Agent</option>
@@ -164,6 +165,11 @@ const V8 = {
           <option value="safe" ${permission === "safe" ? "selected" : ""}>Safe</option>
           <option value="balanced" ${permission === "balanced" ? "selected" : ""}>Balanced</option>
           <option value="autopilot" ${permission === "autopilot" ? "selected" : ""}>Autopilot</option>
+        </select></label>
+        <label><span>Theme</span><select class="ace-ai-select ace-ai-mini-select" data-role="theme-mode">
+          <option value="auto" ${themePref === "auto" ? "selected" : ""}>Auto</option>
+          <option value="dark" ${themePref === "dark" ? "selected" : ""}>Dark</option>
+          <option value="light" ${themePref === "light" ? "selected" : ""}>Light</option>
         </select></label>
         <label class="ace-ai-chip ace-ai-include-full"><input type="checkbox" data-role="include-full" ${Store.settings().includeFullFile ? "checked" : ""}> Include full file</label>
       </div></details>`;
@@ -184,7 +190,7 @@ const V8 = {
     const checkCmd = /^[\w./-]+\.m?js$/i.test(currentFile)
       ? `node --check ${currentFile}`
       : "npm run lint";
-    return `<div class="ace-ai-row nowrap ace-ai-action-chips">${items}<button class="ace-ai-chip" data-act="attach-current-file">Attach file</button><button class="ace-ai-chip" data-tool="agent-codebase">@codebase</button><button class="ace-ai-chip" data-tool="agent-review-file">Review file</button><button class="ace-ai-chip" data-tool="agent-diagnose">Diagnose</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm run lint">Run lint</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm test">Run tests</button><button class="ace-ai-chip" data-act="run-command" data-cmd="${Util.html(checkCmd)}">Syntax</button></div>`;
+    return `<div class="ace-ai-row nowrap ace-ai-action-chips">${items}${VoiceInput.buttonHtml()}<button class="ace-ai-chip" data-act="attach-current-file">Attach file</button><button class="ace-ai-chip" data-tool="agent-codebase">@codebase</button><button class="ace-ai-chip" data-tool="agent-review-file">Review file</button><button class="ace-ai-chip" data-tool="agent-diagnose">Diagnose</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm run lint">Run lint</button><button class="ace-ai-chip" data-act="run-command" data-cmd="npm test">Run tests</button><button class="ace-ai-chip" data-act="run-command" data-cmd="${Util.html(checkCmd)}">Syntax</button></div>`;
   },
   contextStrip() {
     const ctx = Editor.context();
@@ -472,6 +478,8 @@ const V8 = {
     }
     this.bind(root);
     this.render(root);
+    MobileUX.installSwipe(root);
+    MobileUX.installCompactMode(root);
     return root;
   };
 
@@ -693,6 +701,20 @@ const V8 = {
       State.flowDetail = "";
       return this.render(root);
     }
+    if (act === "voice-input") {
+      const textarea = root.querySelector('[data-role="prompt"]');
+      VoiceInput.toggle(
+        (transcript, isFinal) => {
+          if (textarea) {
+            textarea.value = (State.draftPrompt || "") + transcript;
+            if (isFinal) State.draftPrompt = textarea.value;
+          }
+        },
+        () => this.render(root),
+      );
+      this.render(root);
+      return;
+    }
     const out = await baseHandle(act, root);
     State.activeTab = "chat";
     return out;
@@ -710,6 +732,8 @@ const V8 = {
     )
       State.aiMode = "agent";
     if (permSelect) State.permissionMode = permSelect.value || "safe";
+    const themeSelect = root.querySelector('[data-role="theme-mode"]');
+    if (themeSelect) ThemeSystem.setPreference(themeSelect.value || "auto");
     Store.saveSettings({
       agentMode: State.aiMode,
       permissionMode: State.permissionMode,

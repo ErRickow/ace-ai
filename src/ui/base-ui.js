@@ -39,6 +39,7 @@ const UI = {
     if (!asSidebar) State.panel = panel;
     this.bind(panel);
     this.render(panel);
+    ThemeSystem.applyToPanel(panel);
     return panel;
   },
   layout() {
@@ -150,6 +151,7 @@ const UI = {
       this.mountPanel(wrap, false);
     }
     State.panel.classList.remove("ace-ai-hidden");
+    ThemeSystem.applyToPanel(State.panel);
     if (mode) State.activeMode = mode;
     if (tab) State.activeTab = tab;
     this.render(State.panel);

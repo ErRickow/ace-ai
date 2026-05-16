@@ -104,6 +104,8 @@ const Store = {
       clean.push(next);
     });
     this.setJson(C.CHAT_KEY, clean.slice(-C.MAX_CHAT_MESSAGES));
+    // Also persist to project-specific history
+    try { ProjectHistory.saveCurrentChat(); } catch (_) {}
   },
   responseState() {
     return this.getJson(C.RESPONSE_KEY, {
