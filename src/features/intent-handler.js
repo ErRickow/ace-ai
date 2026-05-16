@@ -102,7 +102,13 @@ const IntentHandler = {
       case "ask":
         if (query) {
           UI.openPanel("chat", "agent");
-          State.draftPrompt = decodeURIComponent(query);
+          let decodedQuery;
+          try {
+            decodedQuery = decodeURIComponent(query);
+          } catch (_) {
+            decodedQuery = query;
+          }
+          State.draftPrompt = decodedQuery;
           setTimeout(() => {
             const input = State.panel?.querySelector('[data-role="prompt"]');
             if (input) {
@@ -128,7 +134,13 @@ const IntentHandler = {
       default:
         UI.openPanel("chat");
         if (query) {
-          State.draftPrompt = decodeURIComponent(query);
+          let decodedDefault;
+          try {
+            decodedDefault = decodeURIComponent(query);
+          } catch (_) {
+            decodedDefault = query;
+          }
+          State.draftPrompt = decodedDefault;
         }
     }
   },

@@ -70,6 +70,13 @@ const TerminalCapture = {
             this._lastOutput = this._lastOutput.slice(0, this._maxOutputChars);
             this._truncated = true;
           }
+          State.terminalHistory.unshift({
+            command: cmd,
+            output: this._lastOutput.slice(0, 500),
+            exitCode: this._lastExitCode,
+            time: this._lastTime,
+          });
+          State.terminalHistory = State.terminalHistory.slice(0, 10);
           return this.lastCapture();
         }
       }

@@ -107,6 +107,11 @@ const ProjectHistory = {
     const key = this._projectKey(projectRoot);
     if (key) {
       try { localStorage.removeItem(key); } catch (_) {}
+      // Also remove the entry from the _index array
+      const indexKey = this.PREFIX + "_index";
+      const index = Store.getJson(indexKey, []);
+      const filtered = index.filter((item) => item.key !== key);
+      Store.setJson(indexKey, filtered);
     }
   },
 };

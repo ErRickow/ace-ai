@@ -2072,6 +2072,24 @@
         } catch (_) {}
       });
     },
+    offChange(fn) {
+      const m = this.manager();
+      if (!m || typeof m.off !== "function") return;
+      [
+        "switch-file",
+        "file-loaded",
+        "save-file",
+        "file-content-changed",
+        "rename-file",
+        "change",
+        "changeSelection",
+      ].forEach((event) => {
+        try {
+          m.off(event, fn);
+        } catch (_) {}
+      });
+      State.editorListeners = State.editorListeners.filter(([, f]) => f !== fn);
+    },
     removeListeners() {
       const m = this.manager();
       if (!m || typeof m.off !== "function") return;
@@ -2595,7 +2613,7 @@
         user +=
           "The user referenced files with @file syntax. Use read_file for those paths before making assumptions if the contents are not already in context.\n\n";
       }
-      if (State.terminalHistory?.length && TerminalCapture.lastCapture().output) {
+      if (TerminalCapture.lastCapture().output) {
         const termCtx = TerminalCapture.contextForAgent();
         if (termCtx) user += termCtx + "\n\n";
       }
@@ -6711,6 +6729,17 @@
       if (this._abortController) {
         try { this._abortController.abort(); } catch (_) {}
       }
+      // Remove keydown handler to prevent listener accumulation
+      if (this._keyDom && this._keyHandler) {
+        this._keyDom.removeEventListener("keydown", this._keyHandler, { capture: true });
+        this._keyHandler = null;
+        this._keyDom = null;
+      }
+      // Remove editor onChange callback
+      if (this._editorChangeHandler) {
+        Editor.offChange(this._editorChangeHandler);
+        this._editorChangeHandler = null;
+      }
     },
 
     _bindKeyHandler(view) {
@@ -6967,6 +6996,13 @@
               this._lastOutput = this._lastOutput.slice(0, this._maxOutputChars);
               this._truncated = true;
             }
+            State.terminalHistory.unshift({
+              command: cmd,
+              output: this._lastOutput.slice(0, 500),
+              exitCode: this._lastExitCode,
+              time: this._lastTime,
+            });
+            State.terminalHistory = State.terminalHistory.slice(0, 10);
             return this.lastCapture();
           }
         }
@@ -7105,6 +7141,11 @@
       const key = this._projectKey(projectRoot);
       if (key) {
         try { localStorage.removeItem(key); } catch (_) {}
+        // Also remove the entry from the _index array
+        const indexKey = this.PREFIX + "_index";
+        const index = Store.getJson(indexKey, []);
+        const filtered = index.filter((item) => item.key !== key);
+        Store.setJson(indexKey, filtered);
       }
     },
   };
@@ -7154,6 +7195,13 @@
         panel.classList.toggle("ace-ai-light", theme === "light");
         panel.classList.toggle("ace-ai-dark", theme === "dark");
       });
+    },
+
+    applyToPanel(panel) {
+      if (!panel) return;
+      const theme = this.current();
+      panel.classList.toggle("ace-ai-light", theme === "light");
+      panel.classList.toggle("ace-ai-dark", theme === "dark");
     },
 
     install() {
@@ -7310,7 +7358,8 @@
       if (data && Array.isArray(data.files)) {
         this._cache = data;
         this._lastScanRoot = root;
-        this._lastScanTime = Date.now() - this.STALE_MS + 60000; // Mark as slightly stale
+        // Use actual scannedAt timestamp for freshness check
+        this._lastScanTime = data.scannedAt ? new Date(data.scannedAt).getTime() : 0;
         return this._cache;
       }
       return null;
@@ -7745,7 +7794,13 @@
         case "ask":
           if (query) {
             UI.openPanel("chat", "agent");
-            State.draftPrompt = decodeURIComponent(query);
+            let decodedQuery;
+            try {
+              decodedQuery = decodeURIComponent(query);
+            } catch (_) {
+              decodedQuery = query;
+            }
+            State.draftPrompt = decodedQuery;
             setTimeout(() => {
               const input = State.panel?.querySelector('[data-role="prompt"]');
               if (input) {
@@ -7771,7 +7826,13 @@
         default:
           UI.openPanel("chat");
           if (query) {
-            State.draftPrompt = decodeURIComponent(query);
+            let decodedDefault;
+            try {
+              decodedDefault = decodeURIComponent(query);
+            } catch (_) {
+              decodedDefault = query;
+            }
+            State.draftPrompt = decodedDefault;
           }
       }
     },
@@ -7838,6 +7899,7 @@
       if (!asSidebar) State.panel = panel;
       this.bind(panel);
       this.render(panel);
+      ThemeSystem.applyToPanel(panel);
       return panel;
     },
     layout() {
@@ -7949,6 +8011,7 @@
         this.mountPanel(wrap, false);
       }
       State.panel.classList.remove("ace-ai-hidden");
+      ThemeSystem.applyToPanel(State.panel);
       if (mode) State.activeMode = mode;
       if (tab) State.activeTab = tab;
       this.render(State.panel);

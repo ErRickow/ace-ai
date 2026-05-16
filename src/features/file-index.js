@@ -88,7 +88,8 @@ const FileIndex = {
     if (data && Array.isArray(data.files)) {
       this._cache = data;
       this._lastScanRoot = root;
-      this._lastScanTime = Date.now() - this.STALE_MS + 60000; // Mark as slightly stale
+      // Use actual scannedAt timestamp for freshness check
+      this._lastScanTime = data.scannedAt ? new Date(data.scannedAt).getTime() : 0;
       return this._cache;
     }
     return null;

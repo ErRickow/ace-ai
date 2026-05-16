@@ -136,7 +136,7 @@ const Prompt = {
       user +=
         "The user referenced files with @file syntax. Use read_file for those paths before making assumptions if the contents are not already in context.\n\n";
     }
-    if (State.terminalHistory?.length && TerminalCapture.lastCapture().output) {
+    if (TerminalCapture.lastCapture().output) {
       const termCtx = TerminalCapture.contextForAgent();
       if (termCtx) user += termCtx + "\n\n";
     }

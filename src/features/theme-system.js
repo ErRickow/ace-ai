@@ -44,6 +44,13 @@ const ThemeSystem = {
     });
   },
 
+  applyToPanel(panel) {
+    if (!panel) return;
+    const theme = this.current();
+    panel.classList.toggle("ace-ai-light", theme === "light");
+    panel.classList.toggle("ace-ai-dark", theme === "dark");
+  },
+
   install() {
     this.apply();
     // Listen for system theme changes

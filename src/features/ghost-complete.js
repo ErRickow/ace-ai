@@ -33,6 +33,17 @@ const GhostComplete = {
     if (this._abortController) {
       try { this._abortController.abort(); } catch (_) {}
     }
+    // Remove keydown handler to prevent listener accumulation
+    if (this._keyDom && this._keyHandler) {
+      this._keyDom.removeEventListener("keydown", this._keyHandler, { capture: true });
+      this._keyHandler = null;
+      this._keyDom = null;
+    }
+    // Remove editor onChange callback
+    if (this._editorChangeHandler) {
+      Editor.offChange(this._editorChangeHandler);
+      this._editorChangeHandler = null;
+    }
   },
 
   _bindKeyHandler(view) {
