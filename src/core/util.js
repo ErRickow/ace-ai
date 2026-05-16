@@ -394,7 +394,15 @@ const Util = {
       return `<span class="ace-ai-hl-property">${escaped}</span>`;
     return escaped;
   },
+  // Simple memoization cache for markdown rendering to avoid re-parsing
+  // identical text on every render cycle. Stores last N results.
+  _mdCache: new Map(),
+  _mdCacheMax: 24,
   markdown(text) {
+    const inputKey = String(text || "");
+    if (!inputKey.trim()) return "";
+    const cached = this._mdCache.get(inputKey);
+    if (cached !== undefined) return cached;
     const source = this.prepareMarkdownText(this.normalizeModelText(text));
     const blocks = [];
     let last = 0;
@@ -534,7 +542,14 @@ const Util = {
       last = fence.lastIndex;
     }
     if (last < source.length) blocks.push(renderText(source.slice(last)));
-    return blocks.join("") || "";
+    const result = blocks.join("") || "";
+    // Evict oldest entries when cache is full
+    if (this._mdCache.size >= this._mdCacheMax) {
+      const firstKey = this._mdCache.keys().next().value;
+      this._mdCache.delete(firstKey);
+    }
+    this._mdCache.set(inputKey, result);
+    return result;
   },
   baseUrl(value) {
     return String(value || C.DEFAULT_BASE_URL)

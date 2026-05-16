@@ -43,7 +43,7 @@ const UI = {
   },
   layout() {
     return `
-<div class="ace-ai-head"><div class="ace-ai-head-main"><div class="ace-ai-brand-wrap"><img class="ace-ai-brand-logo" src="${ACE_AI_LOGO}" alt="Ace AI logo"><div><div class="ace-ai-brand">Ace AI <span class="ace-ai-mini">v${C.VERSION}</span></div><div class="ace-ai-sub" data-role="context-line">Acode-native AI coding assistant</div></div></div></div><div class="ace-ai-actions"><button class="ace-ai-iconbtn" data-act="quick-menu">⋮</button><button class="ace-ai-iconbtn" data-act="settings">⚙</button><button class="ace-ai-iconbtn" data-act="toggle-max">⤢</button><button class="ace-ai-iconbtn" data-act="close">×</button></div></div>
+<div class="ace-ai-head"><div class="ace-ai-head-main"><div class="ace-ai-brand-wrap"><img class="ace-ai-brand-logo" src="${ACE_AI_LOGO}" alt="Ace AI logo"><div><div class="ace-ai-brand">Ace AI <span class="ace-ai-mini">v${C.VERSION}</span></div><div class="ace-ai-sub" data-role="context-line">Acode-native AI coding assistant</div></div></div></div><div class="ace-ai-actions"><button class="ace-ai-iconbtn" data-act="quick-menu" aria-label="Quick menu">⋮</button><button class="ace-ai-iconbtn" data-act="settings" aria-label="Settings">⚙</button><button class="ace-ai-iconbtn" data-act="toggle-max" aria-label="Maximize">⤢</button><button class="ace-ai-iconbtn" data-act="close" aria-label="Close panel">×</button></div></div>
 <div class="ace-ai-tabs"><button class="ace-ai-tab" data-tab="chat">Chat</button><button class="ace-ai-tab" data-tab="edit">Edit</button><button class="ace-ai-tab" data-tab="agent">Agent</button><button class="ace-ai-tab" data-tab="changes">Review</button></div>
 <div class="ace-ai-body"><div data-view="chat"></div><div data-view="edit"></div><div data-view="agent"></div><div data-view="changes"></div></div>
 <div class="ace-ai-footer" data-role="footer"></div>
@@ -404,10 +404,17 @@ const UI = {
           v.dataset.view === State.activeTab,
         ),
       );
-    this.renderChat(root.querySelector('[data-view="chat"]'));
-    this.renderEdit(root.querySelector('[data-view="edit"]'));
-    this.renderAgent(root.querySelector('[data-view="agent"]'));
-    this.renderChanges(root.querySelector('[data-view="changes"]'));
+    // Lazy render: only render the active view + settings to avoid unnecessary
+    // DOM thrashing on hidden tabs. Other views render when switched to.
+    const active = State.activeTab || "chat";
+    if (active === "chat")
+      this.renderChat(root.querySelector('[data-view="chat"]'));
+    else if (active === "edit")
+      this.renderEdit(root.querySelector('[data-view="edit"]'));
+    else if (active === "agent")
+      this.renderAgent(root.querySelector('[data-view="agent"]'));
+    else if (active === "changes")
+      this.renderChanges(root.querySelector('[data-view="changes"]'));
     this.renderSettings(root.querySelector('[data-role="settings"]'));
     this.updateFooter(root);
     this.scrollChatToBottom(root);
@@ -731,7 +738,7 @@ const UI = {
   renderSettings(el) {
     if (!el) return;
     const s = Store.settings();
-    el.innerHTML = `<div class="ace-ai-col"><div class="ace-ai-row" style="justify-content:space-between"><div class="ace-ai-brand">Settings</div><button class="ace-ai-iconbtn" data-act="settings">×</button></div><label><div class="ace-ai-label">NAI API Key</div><input class="ace-ai-input" data-set="apiKey" type="password" value="${Util.html(s.apiKey)}" placeholder="nsk_..."></label><label><div class="ace-ai-label">Base URL</div><input class="ace-ai-input" data-set="baseUrl" value="${Util.html(s.baseUrl)}"></label><div class="ace-ai-mini">Endpoint: /v1/responses only. Ace AI stores previous_response_id for conversation continuity and also keeps local history on this device.</div><label><div class="ace-ai-label">Model</div><input class="ace-ai-input" data-set="model" value="${Util.html(s.model)}"></label><label><div class="ace-ai-label">Project Root / Folder URL</div><input class="ace-ai-input" data-set="projectRoot" value="${Util.html(s.projectRoot || "")}" placeholder="optional, e.g. content://... or file:///storage/..."></label><div class="ace-ai-mini">Used when the agent creates relative files such as index.js and the active file does not already have a folder.</div><div class="ace-ai-row"><label style="flex:1"><div class="ace-ai-label">Temperature</div><input class="ace-ai-input" data-set="temperature" value="${Util.html(s.temperature)}"></label><label style="flex:1"><div class="ace-ai-label">Max Tokens</div><input class="ace-ai-input" data-set="maxTokens" value="${Util.html(s.maxTokens)}"></label></div><label class="ace-ai-chip"><input type="checkbox" data-set="includeFullFile" ${s.includeFullFile ? "checked" : ""}> Include full file by default</label><label class="ace-ai-chip"><input type="checkbox" data-set="preferPatch" ${s.preferPatch ? "checked" : ""}> Prefer patch output</label><button class="ace-ai-btn ace-ai-primary" data-act="save-settings">Save Settings</button><div class="ace-ai-row"><button class="ace-ai-btn" data-act="copy-debug">Copy Debug State</button><button class="ace-ai-btn" data-act="new-chat">Clear Chat History</button><button class="ace-ai-btn ace-ai-danger" data-act="clear-state">Clear Runtime State</button></div></div>`;
+    el.innerHTML = `<div class="ace-ai-col"><div class="ace-ai-row" style="justify-content:space-between"><div class="ace-ai-brand">Settings</div><button class="ace-ai-iconbtn" data-act="settings" aria-label="Close settings">×</button></div><label><div class="ace-ai-label">NAI API Key</div><input class="ace-ai-input" data-set="apiKey" type="password" value="${Util.html(s.apiKey)}" placeholder="nsk_..."></label><label><div class="ace-ai-label">Base URL</div><input class="ace-ai-input" data-set="baseUrl" value="${Util.html(s.baseUrl)}"></label><div class="ace-ai-mini">Endpoint: /v1/responses only. Ace AI stores previous_response_id for conversation continuity and also keeps local history on this device.</div><label><div class="ace-ai-label">Model</div><input class="ace-ai-input" data-set="model" value="${Util.html(s.model)}"></label><label><div class="ace-ai-label">Project Root / Folder URL</div><input class="ace-ai-input" data-set="projectRoot" value="${Util.html(s.projectRoot || "")}" placeholder="optional, e.g. content://... or file:///storage/..."></label><div class="ace-ai-mini">Used when the agent creates relative files such as index.js and the active file does not already have a folder.</div><div class="ace-ai-row"><label style="flex:1"><div class="ace-ai-label">Temperature</div><input class="ace-ai-input" data-set="temperature" value="${Util.html(s.temperature)}"></label><label style="flex:1"><div class="ace-ai-label">Max Tokens</div><input class="ace-ai-input" data-set="maxTokens" value="${Util.html(s.maxTokens)}"></label></div><label class="ace-ai-chip"><input type="checkbox" data-set="includeFullFile" ${s.includeFullFile ? "checked" : ""}> Include full file by default</label><label class="ace-ai-chip"><input type="checkbox" data-set="preferPatch" ${s.preferPatch ? "checked" : ""}> Prefer patch output</label><button class="ace-ai-btn ace-ai-primary" data-act="save-settings">Save Settings</button><div class="ace-ai-row"><button class="ace-ai-btn" data-act="copy-debug">Copy Debug State</button><button class="ace-ai-btn" data-act="new-chat">Clear Chat History</button><button class="ace-ai-btn ace-ai-danger" data-act="clear-state">Clear Runtime State</button></div></div>`;
   },
   attachHints(input) {
     // Acode inputHints opens a large native dropdown on some Android builds and

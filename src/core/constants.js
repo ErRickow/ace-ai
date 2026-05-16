@@ -20,6 +20,7 @@ const C = Object.freeze({
   MAX_TOOL_SEARCH_FILES: 80,
   MAX_TOOL_SEARCH_RESULTS: 120,
   MAX_TOOL_SEARCH_CONTEXT_LINES: 2,
+  MAX_READ_TOOL_ROUNDS: 5,
   PANEL_ACTION_ID: "ace-ai.close-panel",
   SIDEBAR_ID: "ace-ai-sidebar",
 });
